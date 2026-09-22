@@ -1,0 +1,10 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "testcase": "./agent.py:agent"
+  },
+  "env": ".env",
+  "http": {
+    "app": "./server_ext.py:app"
+  }
+}

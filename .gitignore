@@ -1,0 +1,19 @@
+# 密钥(切勿提交)
+.env
+
+# 虚拟环境与缓存
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+
+# 运行产物与第三方/测试内容(不入库)
+outputs/
+LightRAG/
+docling-demo/
+
+# LangGraph 运行状态与本机会话
+.langgraph_api/
+.claude/
