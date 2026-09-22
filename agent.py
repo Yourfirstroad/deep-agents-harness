@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import os
 from pathlib import Path
 
 from deepagents import create_deep_agent
@@ -26,9 +27,15 @@ from tools.search_tool import internet_search
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+# 文本主模型:千问 qwen-plus(DashScope OpenAI 兼容端点,复用 QWEN_* 配置)。
+# 之前用 deepseek-chat:该模型 ID 已于 2026-07 退役,且 V4 高峰时段价格偏高;
+# qwen-plus 输入 ¥0.8/输出 ¥2 每百万 token,中文与结构化输出对本场景足够。
+# 想换模型只改 .env 的 QWEN_MODEL(如 qwen-flash 更便宜 / qwen-max 更强)。
 model = init_chat_model(
-    model="deepseek-chat",
-    model_provider="deepseek",
+    model=os.getenv("QWEN_MODEL", "qwen-plus"),
+    model_provider="openai",
+    base_url=os.environ["QWEN_BASE_URL"],
+    api_key=os.environ["QWEN_API_KEY"],
     temperature=0.2,  # 用例生成要稳定、格式守规矩
 )
 

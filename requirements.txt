@@ -1,6 +1,6 @@
 deepagents
 langgraph-cli[inmem]
-langchain-deepseek
+langchain-openai
 openpyxl
 python-dotenv
 python-multipart
