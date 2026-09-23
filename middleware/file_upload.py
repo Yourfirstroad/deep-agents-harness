@@ -123,66 +123,153 @@ class FileUploadMiddleware(AgentMiddleware):
     # 2. 动态注入"可用文档清单 + 处理流程"到 system message
     # ------------------------------------------------------------------
     def _inject_uploads_context(self, request):
-        """把当前可用文档清单和处理流程指令拼进 system message。"""
+        """把当前可用文档清单和处理流程指令拼进 system message。
+
+        流程是状态机推进的(由 /analysis/、/testcases/、/review/ 下的产物文件
+        存在性决定下一步);每份上传文档独立判断当前阶段,主 agent 根据注入的
+        「当前阶段 → 下一步动作」推进。多份文档时,逐份并行处理。
+        """
         uploads = (request.state.get("uploads") or []) if request.state else []
         if not uploads:
             return request
+        files = (request.state.get("files") or {}) if request.state else {}
         doc_list = "\n".join(
             f"- {u['path']}(原始文件:{u['name']},约 {u['size']} 字符)"
             for u in uploads
         )
+        stages_block = self._doc_stages_block(uploads, files)
         extra = (
             "\n\n# 当前已接收的需求文档\n"
             f"{doc_list}\n\n"
-            "对用户最新提到的文档,严格按以下流程处理(需求分析/用例设计/评审"
-            "必须委派子代理执行,子代理看不到对话历史,task 的 description "
-            "必须写全文档路径、doc_name 和产出路径):\n"
-            "1. 用 read_file 读取对应路径的文件,确认文档已解析、内容完整,"
-            "并确定 doc_name(去掉扩展名的文档名);\n"
-            "2. 用 task 委派 requirement-analyzer:阅读该文档并提取功能点与"
-            "测试点,产出写入 /analysis/<doc_name>-test-points.md;"
-            "返回后用 read_file 检查产出,并向用户汇报测试点统计与需求疑问;\n"
-            "2.5 调用 request_approval 请求人工审核测试点清单(stage 传「测试点清单」,"
-            "summary 写模块数/测试点总数/需要重点核对的事项,file_path 传测试点文档路径);"
-            "被驳回时把驳回意见作为上下文重新委派 requirement-analyzer 修订,"
-            "修订后重新提请审核,直到批准;\n"
-            "3. 用 task 委派 testcase-designer:基于测试点文档设计测试用例"
-            "(六列 Markdown 表格),产出写入 /testcases/<doc_name>-testcases.md;\n"
-            "4. 用 read_file 读取用例文件和测试点文档,调用 lint_testcases 做"
-            "机械质量检查(结构/编号/模糊预期/抽象数据/异常占比);结果为 FAIL 时,"
-            "把报告原文作为上下文委派 testcase-designer 修订,修订后重新 lint,"
-            "直至 PASS(无阻断/严重项)再进入评审;\n"
-            "5. 用 task 委派 testcase-reviewer:审查用例的覆盖度、正确性与"
-            "可执行性,评审报告写入 /review/<doc_name>-review.md;"
-            "若结论为「需修订」,把修订意见清单作为上下文再次委派 "
-            "testcase-designer 修订用例文件,然后重新评审,"
-            "直到通过或达到 2 轮修订上限;\n"
-            "6. 用 read_file 读取定稿的 /testcases/<doc_name>-testcases.md,"
-            "先再跑一次 lint_testcases 确认定稿仍为 PASS,然后调用 request_approval "
-            "请求人工审核用例终稿(stage 传「用例终稿」,summary 写用例总数/优先级分布/"
-            "精简模式裁剪说明,file_path 传用例文件路径);批准后才允许导出,"
-            "被驳回时按驳回意见委派 testcase-designer 修订并重新走评审与审核;\n"
-            "7. 审核通过后,把完整内容传给 "
-            "generate_testcase_excel 工具(doc_name 同上),"
-            "它会同时生成 <doc_name>-testcases.xlsx 和 Markdown 终稿 "
-            "<doc_name>-testcases.md;不要用 write_file 保存用例表;\n"
-            "8. 把测试点组织成思维导图(markmap 兼容的 Markdown:# 标题做根节点,"
-            "下级用 ##/### 标题或 - 开头的缩进列表),然后调用 generate_xmind 工具"
-            "(doc_name 同上),它会一次生成 .xmind、浏览器预览 .html 和 .md 三个文件;"
-            "不要用 write_file 保存思维导图。\n"
-            "9. 两个导出工具都成功后,在回复末尾输出「交付物下载」小节,"
-            "用 Markdown 链接给出以下四项,文件名中的 doc_name 与上面一致"
-            "(这是前端下载接口,必须原样输出完整的绝对 URL,不要改成磁盘路径,"
-            "也不要省略主机地址):\n"
-            f"   - [Markdown 终稿]({LANGGRAPH_API_URL}/api/download?file=<doc_name>-testcases.md)\n"
-            f"   - [Excel 用例表]({LANGGRAPH_API_URL}/api/download?file=<doc_name>-testcases.xlsx)\n"
-            f"   - [XMind 思维导图]({LANGGRAPH_API_URL}/api/download?file=<doc_name>-mindmap.xmind)\n"
-            f"   - [思维导图在线预览]({LANGGRAPH_API_URL}/api/download?file=<doc_name>-mindmap.html)"
+            "# 各文档的当前处理阶段\n"
+            f"{stages_block}\n\n"
+            "# 完整流程参考(从当前阶段往后读)\n\n"
+            "## 阶段 A:需求粗扫(广度优先)\n"
+            "- read_file 读上传文档,确认内容完整,确定 doc_name(去掉扩展名);\n"
+            "- task 委派 requirement-rough-scanner:广度优先列候选模块,**只列模块,不展开** F-points/TP,\n"
+            "  描述写:文档路径 + doc_name + 产出路径 /analysis/<doc_name>-rough-scan.md;\n"
+            "- task 返回后 read_file 检查粗扫产出,把候选模块以简洁表格呈现给用户并明确询问 scope。\n\n"
+            "## 阶段 B:scope 确认(主 agent 与用户对话,见 BASE_PROMPT「scope 确认规则」)\n"
+            "- 用户明确列出模块名 → 直接采用,scope=<模块列表>;\n"
+            "- 用户说「全部/都测/你来定」 → 反问一次:「我准备覆盖 X 个模块:[列表],确认吗?」;\n"
+            "  用户确认后 scope=全部,用户纠正按纠正后执行;\n"
+            "- 用户含糊(「几个重要的」「你看着办」「差不多就行」) → 调用 request_scope_selection 工具,\n"
+            "  options=粗扫出的候选模块列表, stage=「测试范围」,触发前端多选弹窗;\n"
+            "  弹窗返回的选中列表就是 scope;被驳回则回到对话重新询问。\n\n"
+            "## 阶段 C:需求深度分析(只做 scope 内模块)\n"
+            "- task 委派 requirement-analyzer,**description 必须显式包含**:\n"
+            "  「用户选定的 scope:<模块列表或\"全部\">」\n"
+            "- analyzer 产出会自动写入「未覆盖模块」段列出 scope 外的模块。\n\n"
+            "## 阶段 D:测试点清单审核\n"
+            "- task 返回后 read_file 检查,调用 request_approval(stage=「测试点清单」,\n"
+            "  summary 写 scope 内/外模块数、scope 内测试点总数、需要重点核对的事项,\n"
+            "  file_path=/analysis/<doc_name>-test-points.md);\n"
+            "- 被驳回时把驳回意见作为上下文重新委派 requirement-analyzer 修订,\n"
+            "  修订后重新提请审核,直到批准。\n\n"
+            "## 阶段 E:用例设计(scope 限定)\n"
+            "- task 委派 testcase-designer,**description 必须显式包含**:\n"
+            "  「用户选定的 scope:<值>」"
+            "  产出写入 /testcases/<doc_name>-testcases.md(六列 Markdown 用例表);\n"
+            "- 跑 lint_testcases 做机械质量检查(FAIL 则把报告原文委派 designer 修订并重新 lint,\n"
+            "  直至 PASS 无阻断/严重项再进入评审)。\n\n"
+            "## 阶段 F:用例评审\n"
+            "- task 委派 testcase-reviewer,产出 /review/<doc_name>-review.md;\n"
+            "- 「需修订」时把修订意见清单委派 testcase-designer 修订,然后重新评审,\n"
+            "  直到通过或达到 2 轮修订上限。\n\n"
+            "## 阶段 G:终稿审核 + 导出\n"
+            "- 评审通过后,read_file 读取定稿用例,再跑一次 lint 确认仍 PASS;\n"
+            "- request_approval(stage=「用例终稿」, summary 写用例总数/优先级分布/裁剪说明,\n"
+            "  file_path=/testcases/<doc_name>-testcases.md);批准后才允许导出;\n"
+            "- read_file 读取定稿内容,调用 generate_testcase_excel 生成\n"
+            "  <doc_name>-testcases.xlsx 与 <doc_name>-testcases.md;\n"
+            "- 把测试点组织成 markmap 兼容 Markdown 大纲,调用 generate_xmind 生成\n"
+            "  <doc_name>-mindmap.xmind / .html / .md。\n\n"
+            "## 阶段 H:输出交付物下载\n"
+            "两个导出工具都成功后,在回复末尾输出「交付物下载」小节\n"
+            "(文件名 doc_name 与上面一致;这是前端下载接口,必须原样输出绝对 URL):\n"
+            f"- [Markdown 终稿]({LANGGRAPH_API_URL}/api/download?file=<doc_name>-testcases.md)\n"
+            f"- [Excel 用例表]({LANGGRAPH_API_URL}/api/download?file=<doc_name>-testcases.xlsx)\n"
+            f"- [XMind 思维导图]({LANGGRAPH_API_URL}/api/download?file=<doc_name>-mindmap.xmind)\n"
+            f"- [思维导图在线预览]({LANGGRAPH_API_URL}/api/download?file=<doc_name>-mindmap.html)\n\n"
+            "# 通用规则\n"
+            "- 子代理产出的文件与主 agent 共享文件系统;task 返回后 read_file 检查产出;\n"
+            "- 子代理的最终消息只是简报,**不要把简报当作用例正文**;\n"
+            "- 委派 analyzer / designer 时,description 必须显式写出「用户选定的 scope」段;\n"
+            "- 多份文档**逐份独立**跑粗扫 → scope 询问 → 详细分析 → 导出,不要混在一起问 scope。"
         )
         base = request.system_message or SystemMessage(content="")
         return request.override(
             system_message=SystemMessage(content=str(base.content) + extra)
         )
+
+    @staticmethod
+    def _doc_stages_block(uploads: list[dict], files: dict) -> str:
+        """为每份上传文档生成「当前阶段 + 下一步动作」小节。
+
+        状态判定(由产物文件存在性):
+        - 阶段 A: /analysis/<doc_name>-rough-scan.md 不存在 → 未开始
+        - 阶段 B: rough-scan 已存在,test-points 不存在 → 粗扫完,等 scope
+        - 阶段 C: test-points 已存在,testcases 不存在 → 已分析,等用例设计
+        - 阶段 D: testcases 已存在,review 不存在 → 已设计,等评审
+        - 阶段 E: review 已存在 → 已评审,等导出收尾
+        """
+        stage_to_action = {
+            "A": (
+                "**先 read_file 读上传文档,确认解析完整;然后 task 委派 requirement-rough-scanner** "
+                "(广度优先列候选模块),产出路径 /analysis/<doc_name>-rough-scan.md;"
+                "完成后 read_file 检查,把候选模块以简洁表格呈现给用户并明确询问 scope。"
+            ),
+            "B": (
+                "**read_file 读 /analysis/<doc_name>-rough-scan.md,把候选模块以简洁表格呈现给用户并明确询问 scope** "
+                "(用户列模块名 → 直接采用;说「全部」 → 反问确认;含糊 → 调 request_scope_selection 工具);"
+                "scope 确定后再委派 requirement-analyzer(scope=<值>)。"
+            ),
+            "C": (
+                "**request_approval(stage=「测试点清单」, file_path=/analysis/<doc_name>-test-points.md)** "
+                "等批准;批准后 task 委派 testcase-designer(scope=<值>),"
+                "产出 /testcases/<doc_name>-testcases.md;然后 lint_testcases 检查。"
+            ),
+            "D": (
+                "**跑 lint_testcases 确认 PASS(无阻断/严重项)**;然后 task 委派 testcase-reviewer "
+                "产出 /review/<doc_name>-review.md;「需修订」时把意见委派 designer 修订,"
+                "然后重新评审,直到通过或达到 2 轮修订上限。"
+            ),
+            "E": (
+                "**read_file 读取定稿用例,再跑一次 lint 确认仍 PASS;然后 "
+                "request_approval(stage=「用例终稿」, file_path=/testcases/<doc_name>-testcases.md)** "
+                "等批准;批准后 generate_testcase_excel + generate_xmind 导出,"
+                "最后输出「交付物下载」链接。"
+            ),
+        }
+        lines: list[str] = []
+        for u in uploads:
+            doc_name = u["name"].rsplit(".", 1)[0]
+            rough = f"/analysis/{doc_name}-rough-scan.md"
+            tp = f"/analysis/{doc_name}-test-points.md"
+            tc = f"/testcases/{doc_name}-testcases.md"
+            rv = f"/review/{doc_name}-review.md"
+            if rv in files:
+                stage = "E"
+                stage_name = "已评审,等导出收尾"
+            elif tc in files:
+                stage = "D"
+                stage_name = "已设计用例,待 lint + 评审"
+            elif tp in files:
+                stage = "C"
+                stage_name = "已做详细分析,待用例设计"
+            elif rough in files:
+                stage = "B"
+                stage_name = "已粗扫,待询问 scope"
+            else:
+                stage = "A"
+                stage_name = "未开始"
+            action = stage_to_action[stage]
+            lines.append(
+                f"### {u['name']}(doc_name=`{doc_name}`)\n"
+                f"- 当前阶段:**{stage_name}**(状态 {stage})\n"
+                f"- 下一步动作:{action}"
+            )
+        return "\n\n".join(lines)
 
     def wrap_model_call(self, request, handler):
         return handler(self._inject_uploads_context(request))

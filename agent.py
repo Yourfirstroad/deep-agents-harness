@@ -21,9 +21,16 @@ from langchain.chat_models import init_chat_model
 
 from middleware.docling_parse import DoclingParseMiddleware
 from middleware.file_upload import FileUploadMiddleware
-from prompts import ANALYZER_PROMPT, BASE_PROMPT, DESIGNER_PROMPT, REVIEWER_PROMPT
+from prompts import (
+    ANALYZER_PROMPT,
+    BASE_PROMPT,
+    DESIGNER_PROMPT,
+    REVIEWER_PROMPT,
+    ROUGH_SCANNER_PROMPT,
+)
 from tools.approval_tool import request_approval
 from tools.mcp_tools import load_all_mcp_tools
+from tools.scope_selection_tool import request_scope_selection
 from tools.search_tool import internet_search
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -66,7 +73,7 @@ backend = CompositeBackend(
     },
 )
 
-# 子代理:需求分析 -> 用例设计 -> 用例评审。
+# 子代理:需求粗扫 → 需求分析 → 用例设计 → 用例评审。
 # 与主 agent 共享同一个虚拟文件系统(/uploads、/analysis、/testcases、/review),
 # 主 agent 通过 task 工具按 description 委派任务。
 # tools=[]:子代理只用内置文件工具(ls/read_file/write_file/edit_file/glob/grep),
@@ -74,8 +81,16 @@ backend = CompositeBackend(
 # skills=["/skills/"]:子代理挂载同一套技能库,按提示词指引 read_file 对应 SKILL.md。
 SUBAGENTS = [
     {
+        "name": "requirement-rough-scanner",
+        "description": "需求粗扫专家:广度优先地把需求文档拆解为候选功能模块清单,写入 /analysis/<doc>-rough-scan.md;不展开 F-points/TP",
+        "system_prompt": ROUGH_SCANNER_PROMPT,
+        "model": model,
+        "tools": [],
+        "skills": ["/skills/"],
+    },
+    {
         "name": "requirement-analyzer",
-        "description": "需求分析专家:阅读 /uploads/ 下解析后的需求文档,提取功能点与测试点清单,写入 /analysis/<doc>-test-points.md",
+        "description": "需求分析专家:阅读 /uploads/ 下解析后的需求文档,按用户选定的 scope 提取功能点与测试点清单,写入 /analysis/<doc>-test-points.md",
         "system_prompt": ANALYZER_PROMPT,
         "model": model,
         "tools": [],
@@ -83,7 +98,7 @@ SUBAGENTS = [
     },
     {
         "name": "testcase-designer",
-        "description": "用例设计专家:基于 /analysis/<doc>-test-points.md 设计完整测试用例(等价类/边界值/场景法等),写入 /testcases/<doc>-testcases.md;也可根据评审意见修订用例",
+        "description": "用例设计专家:基于 /analysis/<doc>-test-points.md 按用户选定的 scope 设计完整测试用例(等价类/边界值/场景法等),写入 /testcases/<doc>-testcases.md;也可根据评审意见修订用例",
         "system_prompt": DESIGNER_PROMPT,
         "model": model,
         "tools": [],
@@ -108,11 +123,18 @@ agent = create_deep_agent(
     # 联网检索与图表生成只挂在主 agent:检索到的背景知识由主 agent
     # 写进委派 description 或落盘文件,供子代理使用;图表用于交付阶段的统计可视化。
     # request_approval 是人工审核闸门(见 tools/approval_tool.py),由 interrupt_on 拦截。
-    tools=[internet_search, request_approval, *mcp_tools],
-    # 人工审核:调用 request_approval 时流程暂停,前端弹出 批准/编辑/驳回,
-    # 批准后继续,驳回意见回给模型修订(由 FileUploadMiddleware 注入的流程指令
-    # 规定在两个节点调用:测试点清单产出后、导出交付前)
-    interrupt_on={"request_approval": True},
+    # request_scope_selection 是 scope 多选弹窗(见 tools/scope_selection_tool.py),
+    # 在粗扫后用户回复含糊时由主 agent 调用,前端弹出多选面板。
+    tools=[internet_search, request_approval, request_scope_selection, *mcp_tools],
+    # interrupt_on:
+    # - request_approval:硬节点人工闸门(测试点清单、用例终稿),
+    #   批准/编辑/驳回,被驳回时驳回意见回给模型修订;
+    # - request_scope_selection:粗扫后的 scope 多选,只在用户回复含糊时触发,
+    #   用户用自然语言明确指定模块时不需要走这条路径。
+    interrupt_on={
+        "request_approval": True,
+        "request_scope_selection": True,
+    },
     # 顺序有意义:DoclingParseMiddleware 先把 /uploads/ 下的原始文档解析成
     # Markdown 写回 files,FileUploadMiddleware 再登记解析结果并注入处理流程
     middleware=[DoclingParseMiddleware(), FileUploadMiddleware()],
