@@ -174,6 +174,8 @@ _MATRIX = (
 def test_full_file_with_matrix_passes():
     report = _run(_MINIMAL_TABLE + _MATRIX)
     assert report.startswith("lint_testcases 结果:PASS"), report
+    # 按模块统计输出
+    assert "LOGIN 2 条(异常 50%)" in report
 
 
 def test_missing_matrix_fails():
@@ -199,9 +201,20 @@ def test_matrix_dangling_tc_fails():
 
 
 def test_matrix_empty_row_blocks():
-    matrix = _MATRIX.replace("TC-LOGIN-002 | 判定表", "— | 判定表")
+    # 覆盖用例列为空且无任何声明 → 阻断
+    matrix = _MATRIX.replace("TC-LOGIN-002 | 判定表", " | 判定表")
     report = _run(_MINIMAL_TABLE + matrix)
     assert "没有覆盖用例" in report
+
+
+def test_matrix_declared_skip_allowed():
+    # 覆盖用例列写「—」并注明不覆盖 → 声明裁剪(精简模式),不阻断
+    matrix = _MATRIX.replace(
+        "TC-LOGIN-002 | 判定表", "— | 判定表"
+    ).replace("错误凭证提示", "错误凭证提示(边缘场景,不覆盖)")
+    report = _run(_MINIMAL_TABLE + matrix)
+    assert "没有覆盖用例" not in report
+    assert "声明不覆盖" in report
 
 
 def test_orphan_tc_warns_but_passes():
@@ -212,3 +225,24 @@ def test_orphan_tc_warns_but_passes():
     report = _run(_MINIMAL_TABLE + extra + _MATRIX)
     assert "未被任何测试点引用" in report
     assert report.startswith("lint_testcases 结果:PASS"), report
+
+
+def test_pipe_less_table_accepted():
+    # 模型常输出行首/行尾无 | 的表格,合法 Markdown,必须能解析(实测踩坑回归)
+    content = (
+        "用例编号 | 用例名称 | 前置条件 | 测试步骤 | 预期结果 | 优先级\n"
+        "---|---|---|---|---|---\n"
+        "TC-LOGIN-001 | 正确账号密码登录成功 | 已注册账号 | 输入手机号 13800001111 和密码 Abc123;点击登录 | 跳转首页,右上角显示 138****1111 | P0\n"
+        "TC-LOGIN-002 | 密码错误统一提示 | 已注册账号 | 输入错误密码 Wrong99;点击登录 | 提示「手机号或密码错误」,登录失败 | P1\n"
+    )
+    report = _run(content + _MATRIX)
+    assert "未找到表头" not in report
+    assert "用例 2 条" in report
+
+    # Excel 导出解析同样容忍该格式,且不吃附录矩阵(遇非表格行即停)
+    from tools.excel_tool import EXPECTED_HEADERS, parse_markdown_table
+    rows = parse_markdown_table(content + _MATRIX)
+    assert rows[0] == EXPECTED_HEADERS
+    assert len(rows) == 3  # 表头 + 2 条用例;矩阵 4 列行不得混入
+    assert all(len(r) == 6 for r in rows)
+

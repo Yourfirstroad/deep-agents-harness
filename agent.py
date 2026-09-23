@@ -22,22 +22,36 @@ from langchain.chat_models import init_chat_model
 from middleware.docling_parse import DoclingParseMiddleware
 from middleware.file_upload import FileUploadMiddleware
 from prompts import ANALYZER_PROMPT, BASE_PROMPT, DESIGNER_PROMPT, REVIEWER_PROMPT
+from tools.approval_tool import request_approval
 from tools.mcp_tools import load_all_mcp_tools
 from tools.search_tool import internet_search
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-# 文本主模型:千问 qwen-plus(DashScope OpenAI 兼容端点,复用 QWEN_* 配置)。
-# 之前用 deepseek-chat:该模型 ID 已于 2026-07 退役,且 V4 高峰时段价格偏高;
-# qwen-plus 输入 ¥0.8/输出 ¥2 每百万 token,中文与结构化输出对本场景足够。
-# 想换模型只改 .env 的 QWEN_MODEL(如 qwen-flash 更便宜 / qwen-max 更强)。
-model = init_chat_model(
-    model=os.getenv("QWEN_MODEL", "qwen-plus"),
-    model_provider="openai",
-    base_url=os.environ["QWEN_BASE_URL"],
-    api_key=os.environ["QWEN_API_KEY"],
-    temperature=0.2,  # 用例生成要稳定、格式守规矩
-)
+# 文本主模型:供应商可切换(.env 的 LLM_PROVIDER=deepseek|qwen)。
+# 2026-09-23 实测:本机到阿里云 DashScope 链路 TLS 反复失败(运营商路由问题),
+# 而 DeepSeek 端点 10/10 稳定;默认用 deepseek-flash(非高峰 ¥1/¥4 每百万 token,
+# 与 qwen-flash 同价)。阿里链路恢复后可切回 qwen。
+_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek").lower()
+if _PROVIDER == "qwen":
+    model = init_chat_model(
+        model=os.getenv("QWEN_MODEL", "qwen-flash"),
+        model_provider="openai",
+        base_url=os.environ["QWEN_BASE_URL"],
+        api_key=os.environ["QWEN_API_KEY"],
+        temperature=0.2,  # 用例生成要稳定、格式守规矩
+        stream_chunk_timeout=300,  # 长流式偶发断流的容忍
+        max_retries=3,
+    )
+else:
+    model = init_chat_model(
+        model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
+        model_provider="deepseek",
+        api_key=os.environ["DEEPSEEK_API_KEY"],
+        temperature=0.2,
+        timeout=300,
+        max_retries=3,
+    )
 
 # 组合后端:/skills/ 路由到项目磁盘上的 skills/ 目录(技能定义随项目版本管理,
 # 由 SkillsMiddleware 启动时发现,read_file 按需加载),
@@ -93,7 +107,12 @@ agent = create_deep_agent(
     model=model,
     # 联网检索与图表生成只挂在主 agent:检索到的背景知识由主 agent
     # 写进委派 description 或落盘文件,供子代理使用;图表用于交付阶段的统计可视化。
-    tools=[internet_search, *mcp_tools],
+    # request_approval 是人工审核闸门(见 tools/approval_tool.py),由 interrupt_on 拦截。
+    tools=[internet_search, request_approval, *mcp_tools],
+    # 人工审核:调用 request_approval 时流程暂停,前端弹出 批准/编辑/驳回,
+    # 批准后继续,驳回意见回给模型修订(由 FileUploadMiddleware 注入的流程指令
+    # 规定在两个节点调用:测试点清单产出后、导出交付前)
+    interrupt_on={"request_approval": True},
     # 顺序有意义:DoclingParseMiddleware 先把 /uploads/ 下的原始文档解析成
     # Markdown 写回 files,FileUploadMiddleware 再登记解析结果并注入处理流程
     middleware=[DoclingParseMiddleware(), FileUploadMiddleware()],

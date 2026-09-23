@@ -56,20 +56,32 @@ def parse_markdown_table(markdown_table: str) -> list[list[str]]:
 
     约定:第一行是表头,第二行是 |---|---| 分隔行,之后每行一条用例。
     单元格内不允许出现未转义的 `|`(由提示词约束)。
+    行首/行尾的 `|` 可有可无(模型时常省略),按竖线数识别表格行。
     """
     lines = [ln.strip() for ln in markdown_table.strip().splitlines() if ln.strip()]
+    # 定位表头(列名与顺序完全一致),只吃紧随其后的数据行;
+    # 遇到非表格行即停止,避免把文末附录的矩阵/判定表混进来
+    header_idx = None
+    for i, ln in enumerate(lines):
+        if ln.count("|") >= len(EXPECTED_HEADERS) - 1:
+            cells = [c.strip() for c in ln.strip("|").split("|")]
+            if cells == EXPECTED_HEADERS:
+                header_idx = i
+                break
     rows: list[list[str]] = []
-    for ln in lines:
-        if not ln.startswith("|"):
-            continue
-        cells = [c.strip() for c in ln.strip("|").split("|")]
-        # 跳过分隔行 |---|---|
-        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
-            continue
-        rows.append(cells)
+    if header_idx is not None:
+        rows.append(EXPECTED_HEADERS)
+        for ln in lines[header_idx + 1 :]:
+            if ln.count("|") < len(EXPECTED_HEADERS) - 1:
+                break  # 表格结束
+            cells = [c.strip() for c in ln.strip("|").split("|")]
+            # 跳过分隔行 |---|---|
+            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+                continue
+            rows.append(cells)
 
     if not rows:
-        raise MarkdownTableError("未在输入中找到 Markdown 表格(行需以 | 开头)")
+        raise MarkdownTableError("未在输入中找到 Markdown 表格(行需以 | 分隔六列)")
     header = rows[0]
     if header[: len(EXPECTED_HEADERS)] != EXPECTED_HEADERS:
         raise MarkdownTableError(

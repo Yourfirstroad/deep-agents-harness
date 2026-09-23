@@ -12,6 +12,7 @@ skills/testcase-review/SKILL.md「量化指标」。
 
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 
@@ -22,9 +23,9 @@ from tools.excel_tool import EXPECTED_HEADERS
 # 结果分级:阻断 > 严重 > 一般(与 testcase-review 的问题分级对齐)
 LEVELS = ("阻断", "严重", "一般")
 
-# 用例编号:TC-<模块缩写>-<三位序号>
-_ID_RE = re.compile(r"^TC-([A-Z0-9]{2,8})-(\d{3})$")
-_TP_RE = re.compile(r"TP-([A-Z0-9]{2,8})-(\d{3})")
+# 用例编号:TC-<模块缩写>-<三位序号>;模块缩写允许多段中划线(如 FRONT-HOME)
+_ID_RE = re.compile(r"^TC-([A-Z0-9]+(?:-[A-Z0-9]+)*)-(\d{3})$")
+_TP_RE = re.compile(r"TP-([A-Z0-9]+(?:-[A-Z0-9]+)*)-(\d{3})")
 
 # 预期结果中的禁用模糊词:出现即违规(技能红线:禁止"正常""正确"这类词)
 _VAGUE_BANNED = ("正常", "无误", "无异常", "符合预期", "符合要求", "没有问题")
@@ -58,7 +59,7 @@ _P0_RATIO_RANGE = (0.10, 0.30)  # 评审经验区间:P0 占比 10%-20%,超 30% �
 # 追溯矩阵(「设计过程」附录):表头固定「测试点编号 | 测试点摘要 | 覆盖用例编号 | 设计技术」
 _TRACE_FIRST_COL = "测试点编号"
 _TRACE_TC_COL = "覆盖用例编号"
-_TC_REF_RE = re.compile(r"TC-[A-Z0-9]{2,8}-\d{3}")
+_TC_REF_RE = re.compile(r"TC-[A-Z0-9]+(?:-[A-Z0-9]+)*-\d{3}")
 
 
 class _Issue:
@@ -72,6 +73,17 @@ class _Issue:
         return f"{idx}. [{self.case_id}] {self.problem} → {self.fix}"
 
 
+def _row_cells(line: str, min_cols: int = len(EXPECTED_HEADERS)) -> list[str] | None:
+    """把一行解析为表格单元格;不像表格行(竖线数不够)返回 None。
+
+    行首/行尾的 `|` 可有可无(模型时常省略),但列数不能少。
+    """
+    s = line.strip()
+    if s.count("|") < min_cols - 1:
+        return None
+    return [c.strip() for c in s.strip("|").split("|")]
+
+
 def _extract_case_table(content: str) -> tuple[list[list[str]] | None, str | None]:
     """从用例文件中定位并解析六列用例表。
 
@@ -81,27 +93,23 @@ def _extract_case_table(content: str) -> tuple[list[list[str]] | None, str | Non
     lines = content.splitlines()
     header_idx = None
     for i, ln in enumerate(lines):
-        s = ln.strip()
-        if not s.startswith("|"):
-            continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
-        if cells == EXPECTED_HEADERS:
+        cells = _row_cells(ln)
+        if cells and cells == EXPECTED_HEADERS:
             header_idx = i
             break
     if header_idx is None:
         return None, (
             f"未找到表头为「{' | '.join(EXPECTED_HEADERS)}」的用例表"
-            "(判定表等附录表格不算;表头差一个字都不合规)"
+            "(行首/行尾的 `|` 可有可无,但列名与顺序必须完全一致;判定表等附录表格不算)"
         )
 
     rows: list[list[str]] = []
     for ln in lines[header_idx + 1 :]:
-        s = ln.strip()
-        if not s.startswith("|"):
+        cells = _row_cells(ln)
+        if cells is None:
             if rows:  # 表格结束
                 break
             continue  # 表头与首行数据之间允许隔着分隔行/空行
-        cells = [c.strip() for c in s.strip("|").split("|")]
         if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
             continue  # |---|---| 分隔行
         rows.append(cells)
@@ -244,8 +252,9 @@ def _check_duplicates(rows: list[list[str]], issues: list[_Issue]) -> None:
 
 
 def _stats(rows: list[list[str]]) -> dict:
-    """优先级分布与异常场景占比。"""
+    """优先级分布、异常场景占比、按模块分布。"""
     priorities: dict[str, int] = defaultdict(int)
+    modules: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "abnormal": 0})
     abnormal = 0
     valid = 0
     for cells in rows:
@@ -254,13 +263,19 @@ def _stats(rows: list[list[str]]) -> dict:
         valid += 1
         priorities[cells[5].strip().upper()] += 1
         text = f"{cells[1]} {cells[3]} {cells[4]}"
-        if any(k in text for k in _ABNORMAL_KEYWORDS):
+        is_abnormal = any(k in text for k in _ABNORMAL_KEYWORDS)
+        if is_abnormal:
             abnormal += 1
+        m = _ID_RE.match(cells[0])
+        if m:
+            modules[m.group(1)]["total"] += 1
+            modules[m.group(1)]["abnormal"] += int(is_abnormal)
     return {
         "total": valid,
         "priorities": dict(priorities),
         "abnormal": abnormal,
         "abnormal_ratio": abnormal / valid if valid else 0.0,
+        "modules": dict(modules),
     }
 
 
@@ -283,6 +298,18 @@ def _check_stats(stats: dict, issues: list[_Issue]) -> None:
             f"P0 占比 {p0_ratio:.0%} 超过 {_P0_RATIO_RANGE[1]:.0%},定级可能过松",
             "对照定级矩阵复核:只有资损/数据丢失/安全泄露/主流程阻断才是 P0",
         ))
+    # 冒烟模式总量硬约束:超过 30 条直接 FAIL 打回(standard/full 档不设总量上限,
+    # 覆盖率由追溯矩阵 + 评审兜底)
+    scope = os.getenv("TESTCASE_SCOPE", "standard").lower()
+    if scope == "slim":
+        scope = "smoke"
+    if scope == "smoke" and total > 30:
+        issues.append(_Issue(
+            "严重", "用例集",
+            f"冒烟模式下用例总量 {total} 条,超过 30 条硬上限",
+            "按 P0/P1 尺度直接删除低价值用例(同一测试点只留最高风险代表场景,"
+            "每模块最多 5 条),被删测试点在追溯矩阵标注「—」",
+        ))
 
 
 def _extract_trace_matrix(content: str) -> list[tuple[str, list[str]]] | None:
@@ -294,10 +321,7 @@ def _extract_trace_matrix(content: str) -> list[tuple[str, list[str]]] | None:
     lines = content.splitlines()
     header_idx, tc_col = None, None
     for i, ln in enumerate(lines):
-        s = ln.strip()
-        if not s.startswith("|"):
-            continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
+        cells = _row_cells(ln, min_cols=4)
         if cells and cells[0] == _TRACE_FIRST_COL and _TRACE_TC_COL in cells:
             header_idx, tc_col = i, cells.index(_TRACE_TC_COL)
             break
@@ -306,12 +330,11 @@ def _extract_trace_matrix(content: str) -> list[tuple[str, list[str]]] | None:
 
     rows: list[tuple[str, list[str]]] = []
     for ln in lines[header_idx + 1 :]:
-        s = ln.strip()
-        if not s.startswith("|"):
+        cells = _row_cells(ln, min_cols=4)
+        if cells is None:
             if rows:
                 break
             continue
-        cells = [c.strip() for c in s.strip("|").split("|")]
         if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
             continue  # 分隔行
         m = _TP_RE.search(cells[0])
@@ -333,18 +356,11 @@ def _check_traceability(
     """
     hints: list[str] = []
     tp_ids: list[str] = []
+    tp_modules: dict[str, list[str]] = defaultdict(list)
     if test_points_content.strip():
-        tp_ids = [m.group(0) for m in _TP_RE.finditer(test_points_content)]
-        tp_modules: dict[str, int] = defaultdict(int)
         for m in _TP_RE.finditer(test_points_content):
-            tp_modules[m.group(1)] += 1
-        for module, count in sorted(tp_modules.items()):
-            if not re.search(rf"TC-{re.escape(module)}-\d{{3}}", content):
-                issues.append(_Issue(
-                    "阻断", f"模块{module}",
-                    f"测试点文档中该模块有 {count} 个测试点,但用例表没有任何 TC-{module}-xxx 用例",
-                    "为该模块补设计用例;若模块已改名,统一两处缩写",
-                ))
+            tp_ids.append(m.group(0))
+            tp_modules[m.group(1)].append(m.group(0))
 
     matrix = _extract_trace_matrix(content)
     if matrix is None:
@@ -353,6 +369,14 @@ def _check_traceability(
             "缺少追溯矩阵(表头:测试点编号 | 测试点摘要 | 覆盖用例编号 | 设计技术)",
             "为每个测试点补一行映射;矩阵是评审覆盖核对的基准,缺失按输出契约打回",
         ))
+        # 无矩阵时无法验证声明裁剪,模块级覆盖一律从严
+        for module, tps in sorted(tp_modules.items()):
+            if not re.search(rf"TC-{re.escape(module)}-\d{{3}}", content):
+                issues.append(_Issue(
+                    "阻断", f"模块{module}",
+                    f"测试点文档中该模块有 {len(tps)} 个测试点,但用例表没有任何 TC-{module}-xxx 用例",
+                    "为该模块补设计用例;若模块已改名,统一两处缩写",
+                ))
         if tp_ids:  # 无矩阵时退化为全文粗查,给出提示
             uncovered = [t for t in tp_ids if t not in content]
             if uncovered:
@@ -364,11 +388,44 @@ def _check_traceability(
         return hints
 
     empty_rows = [tp for tp, tcs in matrix if not tcs]
+    # 区分「声明不覆盖」(精简模式:覆盖用例编号列写 —/不覆盖)与「漏覆盖」;
+    # 前者合法,后者阻断。声明行需要从原始矩阵行文本里判断,这里重新扫一遍
+    declared_skip: set[str] = set()
     if empty_rows:
+        for ln in content.splitlines():
+            cells = _row_cells(ln, min_cols=4)
+            if not cells or cells[0] in ("", _TRACE_FIRST_COL):
+                continue
+            m = _TP_RE.search(cells[0])
+            if not m:
+                continue
+            row_text = " ".join(cells)
+            if not _TC_REF_RE.findall(row_text) and ("—" in row_text or "不覆盖" in row_text):
+                declared_skip.add(m.group(0))
+    undeclared = [tp for tp in empty_rows if tp not in declared_skip]
+    if undeclared:
         issues.append(_Issue(
             "阻断", "追溯矩阵",
-            f"{len(empty_rows)} 个测试点没有覆盖用例:{'、'.join(empty_rows[:10])}",
-            "为这些测试点补设计用例,或在矩阵中注明不覆盖的原因",
+            f"{len(undeclared)} 个测试点没有覆盖用例:{'、'.join(undeclared[:10])}",
+            "为这些测试点补设计用例;精简模式下主动裁剪的,覆盖用例编号列写「—」并注明原因",
+        ))
+    if declared_skip:
+        hints.append(
+            f"{len(declared_skip)} 个测试点声明不覆盖(精简模式裁剪):"
+            + "、".join(sorted(declared_skip)[:10])
+        )
+
+    # 模块级覆盖:整模块无用例时,若该模块全部测试点都已声明不覆盖(裁剪),合法;
+    # 否则阻断。模块裁剪判定依赖矩阵,矩阵缺失时退化为一律阻断
+    for module, tps in sorted(tp_modules.items()):
+        if re.search(rf"TC-{re.escape(module)}-\d{{3}}", content):
+            continue
+        if matrix is not None and tps and all(tp in declared_skip for tp in tps):
+            continue  # 整模块声明裁剪
+        issues.append(_Issue(
+            "阻断", f"模块{module}",
+            f"测试点文档中该模块有 {len(tps)} 个测试点,但用例表没有任何 TC-{module}-xxx 用例",
+            "为该模块补设计用例;精简模式下裁剪的,在追溯矩阵逐行写「—」并注明原因",
         ))
 
     if tp_ids:
@@ -454,6 +511,14 @@ def lint_testcases(markdown_table: str, test_points_content: str = "") -> str:
         + " / ".join(f"{p} {prio.get(p, 0)}" for p in ("P0", "P1", "P2", "P3"))
         + f";异常场景占比 {stats['abnormal_ratio']:.0%}(红线 ≥30%)"
     )
+    if stats["modules"]:
+        parts.append(
+            "按模块: "
+            + " / ".join(
+                f"{mod} {d['total']} 条(异常 {d['abnormal'] / d['total']:.0%})"
+                for mod, d in sorted(stats["modules"].items())
+            )
+        )
     if hints:
         parts.append("\n提示:")
         parts.extend(f"- {h}" for h in hints)

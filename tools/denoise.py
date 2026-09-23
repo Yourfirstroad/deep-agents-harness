@@ -75,7 +75,7 @@ class _Config:
     max_delete_ratio: float = 0.3
 
 
-def _load_config() -> _Config:
+def _load_config(overrides: dict | None = None) -> _Config:
     cfg = _Config()
 
     def _int(key: str, default: int) -> int:
@@ -96,11 +96,27 @@ def _load_config() -> _Config:
             return default
         return val.lower() == "true"
 
-    cfg.repeat_min_pages = max(2, _int("DOCLING_DENOISE_REPEAT_MIN_PAGES", cfg.repeat_min_pages))
-    cfg.repeat_maxlen = max(10, _int("DOCLING_DENOISE_REPEAT_MAXLEN", cfg.repeat_maxlen))
+    cfg.repeat_min_pages = _int("DOCLING_DENOISE_REPEAT_MIN_PAGES", cfg.repeat_min_pages)
+    cfg.repeat_maxlen = _int("DOCLING_DENOISE_REPEAT_MAXLEN", cfg.repeat_maxlen)
     cfg.page_number = _bool("DOCLING_DENOISE_PAGE_NUMBER", cfg.page_number)
     cfg.empty_image = _bool("DOCLING_DENOISE_EMPTY_IMAGE", cfg.empty_image)
     cfg.max_delete_ratio = _float("DOCLING_DENOISE_MAX_DELETE_RATIO", cfg.max_delete_ratio)
+
+    # 按次调用覆盖(前端降噪参数调节经 CLI 传入);env 只是默认值
+    if overrides:
+        if overrides.get("repeat_min_pages") is not None:
+            cfg.repeat_min_pages = int(overrides["repeat_min_pages"])
+        if overrides.get("repeat_maxlen") is not None:
+            cfg.repeat_maxlen = int(overrides["repeat_maxlen"])
+        if overrides.get("page_number") is not None:
+            cfg.page_number = bool(overrides["page_number"])
+        if overrides.get("empty_image") is not None:
+            cfg.empty_image = bool(overrides["empty_image"])
+        if overrides.get("max_delete_ratio") is not None:
+            cfg.max_delete_ratio = float(overrides["max_delete_ratio"])
+
+    cfg.repeat_min_pages = max(2, cfg.repeat_min_pages)
+    cfg.repeat_maxlen = max(10, cfg.repeat_maxlen)
     return cfg
 
 
@@ -208,18 +224,24 @@ def _remove_whole_lines(
         removed_keys.add(norm)
 
 
-def denoise_markdown(markdown: str, json_content: dict | None = None) -> DenoiseResult:
+def denoise_markdown(
+    markdown: str,
+    json_content: dict | None = None,
+    overrides: dict | None = None,
+) -> DenoiseResult:
     """清洗 docling 解析出的 Markdown。
 
     Args:
         markdown: docling-serve 返回的 md_content。
         json_content: 同一次解析的 DoclingDocument JSON;为 None 时
             R1/R2 自动跳过,仅执行纯规则 R3-R5。
+        overrides: 按次调用传入的参数覆盖(键:_Config 字段名),
+            优先级高于 .env;供 CLI/前端调参使用。
 
     Returns:
         DenoiseResult;触发安全刹车时 aborted=True 且 markdown 为原文。
     """
-    cfg = _load_config()
+    cfg = _load_config(overrides)
     lines = markdown.split("\n")
     total_lines = len(lines)
     removals: list[RemovalRecord] = []
