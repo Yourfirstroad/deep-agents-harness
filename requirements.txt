@@ -1,6 +1,8 @@
 deepagents
 langgraph-cli[inmem]
 langchain-openai
+langchain-deepseek
+colorama; sys_platform == 'win32'
 openpyxl
 python-dotenv
 python-multipart
